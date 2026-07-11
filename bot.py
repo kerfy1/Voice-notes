@@ -16,6 +16,7 @@ Telegram-бот: голосовое → Whisper → Claude (OpenRouter) → ка
 """
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -42,6 +43,9 @@ from telegram.ext import (
     filters,
 )
 
+import admin
+import db
+
 # ---------- config ----------
 # Ищем файл с ключами рядом со скриптом. Принимаем несколько вариантов имени,
 # т.к. Windows любит незаметно добавлять .env или .txt.
@@ -66,8 +70,6 @@ _missing = [
     name for name, value in {
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "OPENROUTER_API_KEY": OPENROUTER_API_KEY,
-        "NOTION_TOKEN": NOTION_TOKEN,
-        "NOTION_DATABASE_ID": NOTION_DATABASE_ID,
     }.items() if not value
 ]
 if _missing:
@@ -113,13 +115,33 @@ PROP_ESSENCE = os.getenv("NOTION_PROP_ESSENCE", "Суть")
 PROP_DATE = os.getenv("NOTION_PROP_DATE", "Дата")
 PROP_TAG = os.getenv("NOTION_PROP_TAG", "Тег")
 
-# Ограничение доступа: если задан ALLOWED_USER_IDS (через запятую) — пускаем только их.
-_allowed = os.getenv("ALLOWED_USER_IDS", "").strip()
-ALLOWED_USER_IDS = {int(x) for x in _allowed.split(",") if x.strip()} if _allowed else None
+# ---------- доступ и лимиты ----------
+# Админы: полный функционал + Notion + админ-панель. ID через запятую (@userinfobot).
+_admins = os.getenv("ADMIN_IDS", os.getenv("ALLOWED_USER_IDS", "")).strip()
+ADMIN_IDS = {int(x) for x in _admins.split(",") if x.strip()}
+
+# Лимиты обычных пользователей (скользящее окно 7 дней).
+# Срабатывает то, что кончится раньше: количество ИЛИ объём.
+FREE_LIMITS = {
+    "voice_count": int(os.getenv("FREE_VOICE_COUNT", "5")),
+    "voice_seconds": int(os.getenv("FREE_VOICE_MINUTES", "31")) * 60,
+    "text_count": int(os.getenv("FREE_TEXT_COUNT", "5")),
+    "text_chars": int(os.getenv("FREE_TEXT_CHARS", "25000")),
+}
+# Максимальный размер одного текстового сообщения для обычного пользователя.
+FREE_MAX_TEXT_LENGTH = int(os.getenv("FREE_MAX_TEXT_LENGTH", "5000"))
+# Максимальная длина одного голосового для обычного пользователя (сек).
+FREE_MAX_VOICE_SECONDS = int(os.getenv("FREE_MAX_VOICE_MINUTES", "15")) * 60
+# Потолок выжимки для обычного пользователя — чтобы влезала в одно сообщение TG.
+FREE_SUMMARY_CHARS = int(os.getenv("FREE_SUMMARY_CHARS", "1200"))
 
 # Язык транскрипции по умолчанию для кнопки-подсказки.
 # Пусто → бот всегда спрашивает. Можно задать "ru"/"uk"/"auto", чтобы пропускать вопрос.
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "").strip().lower()
+
+# Минимальная длина текстового сообщения, чтобы делать из него конспект.
+# Короткие реплики ("ок", "привет") игнорируем.
+MIN_TEXT_LENGTH = int(os.getenv("MIN_TEXT_LENGTH", "100"))
 
 # Директория для временных аудио (кросс-платформенно: %TEMP% на Windows, /tmp на *nix)
 TMP_DIR = Path(tempfile.gettempdir()) / "voice_bot"
@@ -145,22 +167,103 @@ whisper_client = AsyncOpenAI(
     base_url=OPENROUTER_BASE_URL,
     timeout=120.0,
 )
-notion = NotionClient(auth=NOTION_TOKEN)
+notion = NotionClient(auth=NOTION_TOKEN) if NOTION_TOKEN else None
 
 
 # =====================================================================
 # helpers
 # =====================================================================
-def _is_allowed(update: Update) -> bool:
-    if ALLOWED_USER_IDS is None:
-        return True
-    user = update.effective_user
-    return bool(user and user.id in ALLOWED_USER_IDS)
+def _esc(text: str) -> str:
+    """
+    Экранирует HTML для Telegram parse_mode=HTML.
+    Обязательно для любого пользовательского текста: символы < > & сломают разметку.
+    """
+    return html.escape(text or "", quote=False)
 
 
-async def _reject(update: Update) -> None:
-    if update.message:
-        await update.message.reply_text("⛔ Доступ запрещён.")
+def _is_admin(update: Update) -> bool:
+    u = update.effective_user
+    return bool(u and u.id in ADMIN_IDS)
+
+
+async def _register(update: Update) -> dict:
+    """Регистрирует/обновляет пользователя в БД и возвращает его запись."""
+    u = update.effective_user
+    await asyncio.to_thread(db.upsert_user, u.id, u.username, u.first_name)
+    return await asyncio.to_thread(db.get_user, u.id)
+
+
+def _fmt_left(usage: dict) -> str:
+    """Строка «сколько осталось» для обычного пользователя."""
+    v_left = max(0, FREE_LIMITS["voice_count"] - usage["voice_count"])
+    v_min_left = max(0.0, (FREE_LIMITS["voice_seconds"] - usage["voice_seconds"]) / 60)
+    t_left = max(0, FREE_LIMITS["text_count"] - usage["text_count"])
+    t_ch_left = max(0, FREE_LIMITS["text_chars"] - usage["text_chars"])
+    return (
+        f"🗣 Голосовых: {v_left} шт / {v_min_left:.0f} мин\n"
+        f"📝 Текстов: {t_left} шт / {t_ch_left} симв."
+    )
+
+
+async def _check_limits(user_id: int, kind: str, amount: float) -> tuple[bool, str]:
+    """
+    Проверяет лимиты обычного пользователя.
+    kind: "voice" (amount = секунды) | "text" (amount = символы).
+    Возвращает (можно?, текст_отказа).
+    """
+    usage = await asyncio.to_thread(db.weekly_usage, user_id)
+
+    if kind == "voice":
+        if usage["voice_count"] >= FREE_LIMITS["voice_count"]:
+            return False, (
+                f"⛔ Недельный лимит голосовых исчерпан "
+                f"({FREE_LIMITS['voice_count']} шт).\n\n"
+                f"Осталось:\n{_fmt_left(usage)}\n\n"
+                "Лимит обновляется автоматически (скользящие 7 дней)."
+            )
+        if usage["voice_seconds"] + amount > FREE_LIMITS["voice_seconds"]:
+            left = (FREE_LIMITS["voice_seconds"] - usage["voice_seconds"]) / 60
+            return False, (
+                f"⛔ Не хватает минут: это голосовое на {amount/60:.1f} мин, "
+                f"а осталось {left:.1f} мин из "
+                f"{FREE_LIMITS['voice_seconds']/60:.0f} в неделю.\n\n"
+                f"Осталось:\n{_fmt_left(usage)}"
+            )
+    else:  # text
+        if usage["text_count"] >= FREE_LIMITS["text_count"]:
+            return False, (
+                f"⛔ Недельный лимит текстов исчерпан "
+                f"({FREE_LIMITS['text_count']} шт).\n\n"
+                f"Осталось:\n{_fmt_left(usage)}\n\n"
+                "Лимит обновляется автоматически (скользящие 7 дней)."
+            )
+        if usage["text_chars"] + amount > FREE_LIMITS["text_chars"]:
+            left = FREE_LIMITS["text_chars"] - usage["text_chars"]
+            return False, (
+                f"⛔ Не хватает символов: в тексте {int(amount)}, "
+                f"а осталось {left} из {FREE_LIMITS['text_chars']} в неделю.\n\n"
+                f"Осталось:\n{_fmt_left(usage)}"
+            )
+
+    return True, ""
+
+
+async def _gate(update: Update, kind: str, amount: float) -> tuple[bool, bool, str]:
+    """
+    Единая проверка на входе.
+    Возвращает (пропустить?, is_admin, текст_отказа).
+    """
+    user = await _register(update)
+    is_admin = _is_admin(update)
+
+    if is_admin or user["status"] == "unlimited":
+        return True, is_admin, ""
+
+    if user["status"] == "blocked":
+        return False, False, "⛔ Доступ к боту ограничен."
+
+    ok, reason = await _check_limits(user["user_id"], kind, amount)
+    return ok, False, reason
 
 
 def _run_ffmpeg(cmd: list[str]) -> str:
@@ -348,18 +451,41 @@ def _strip_markdown(text: str) -> str:
     return text
 
 
-async def analyze_with_claude(transcription: str, highlights: str | None) -> dict:
-    """Отправляет транскрипцию (+ акценты) в Claude через OpenRouter, ждёт JSON."""
+async def analyze_with_claude(source_text: str, highlights: str | None,
+                              source: str = "voice", concise: bool = False) -> dict:
+    """
+    Отправляет исходный текст (+ акценты) в Claude через OpenRouter, ждёт JSON.
+    source:  "voice" — расшифровка голосового, "text" — текст напрямую.
+    concise: True для обычных пользователей — краткая выжимка в одно сообщение TG.
+    """
+    origin = (
+        "расшифровок голосовых сообщений"
+        if source == "voice"
+        else "текстов, которые пользователь присылает напрямую "
+             "(свои заметки, пересланные посты, статьи, выдержки)"
+    )
+    if concise:
+        summary_rule = (
+            f"  - summary: КРАТКАЯ выжимка, строго не длиннее "
+            f"{FREE_SUMMARY_CHARS} символов. Только самое важное: "
+            "5-8 ключевых тезисов маркированным списком (`- `). "
+            "Без вступлений и воды. Тот же язык, что и оригинал.\n"
+        )
+    else:
+        summary_rule = (
+            "  - summary: структурированный конспект. Выдели ключевые тезисы "
+            "маркированным списком (используй `- ` для пунктов), при необходимости — "
+            "подсекции. Пиши по делу, без воды. Тот же язык, что и оригинал.\n"
+        )
+
     system_prompt = (
-        "Ты помощник, который делает структурированные конспекты из "
-        "расшифровок голосовых сообщений на русском или украинском языке.\n\n"
+        f"Ты помощник, который делает структурированные конспекты из "
+        f"{origin} на русском или украинском языке.\n\n"
         "Проанализируй текст и верни строго валидный JSON без markdown-обрамления "
         "и без лишних комментариев, с полями:\n"
         "  - title: короткий заголовок конспекта (до 60 символов), "
         "на том же языке, что и оригинал.\n"
-        "  - summary: структурированный конспект. Выдели ключевые тезисы "
-        "маркированным списком (используй `- ` для пунктов), при необходимости — "
-        "подсекции. Пиши по делу, без воды. Тот же язык, что и оригинал.\n"
+        + summary_rule +
         "  - tag: одно слово-тег для категоризации, с большой буквы. "
         "Примеры: Ідея, Подкаст, Роздуми, План, Навчання, Робота, Цитата, Задача. "
         "На том же языке, что и оригинал.\n\n"
@@ -373,7 +499,8 @@ async def analyze_with_claude(transcription: str, highlights: str | None) -> dic
         "(вынеси в отдельный блок «Акценти» / «Акценты» в начале)."
     )
 
-    user_content = f"Транскрипция:\n\"\"\"\n{transcription}\n\"\"\""
+    label = "Транскрипция" if source == "voice" else "Исходный текст"
+    user_content = f"{label}:\n\"\"\"\n{source_text}\n\"\"\""
     if highlights:
         user_content += (
             f"\n\nАкценты от пользователя (выделить отдельно):\n"
@@ -491,11 +618,17 @@ def _batched(items: list, size: int):
         yield items[i : i + size]
 
 
-def create_notion_page(structured: dict, transcription: str) -> str:
+def create_notion_page(structured: dict, source_text: str, source: str = "voice") -> str:
     """
     Создаёт страницу в Notion. Для длинных аудио разбивает контент
     на батчи по 90 блоков и дописывает через blocks.children.append.
+    source: "voice" | "text" — влияет только на заголовок блока с оригиналом.
     """
+    if notion is None or not NOTION_DATABASE_ID:
+        raise RuntimeError(
+            "Notion не настроен: заполни NOTION_TOKEN и NOTION_DATABASE_ID "
+            "в файле api_key."
+        )
     title = structured["title"]
     summary = structured["summary"]
     tag = structured["tag"]
@@ -516,10 +649,13 @@ def create_notion_page(structured: dict, transcription: str) -> str:
 
     # Собираем тело страницы плоским списком блоков (без toggle,
     # чтобы можно было честно батчить длинные транскрипции).
+    origin_heading = (
+        "Оригинальная транскрипция" if source == "voice" else "Исходный текст"
+    )
     body: list[dict] = [_heading("Конспект", 2)]
     body.extend(_paragraph(c) for c in _chunks(summary))
-    body.append(_heading("Оригинальная транскрипция", 2))
-    body.extend(_paragraph(c) for c in _chunks(transcription))
+    body.append(_heading(origin_heading, 2))
+    body.extend(_paragraph(c) for c in _chunks(source_text))
 
     # Notion: не более 100 блоков за один запрос → берём 90 с запасом.
     batches = list(_batched(body, 90))
@@ -542,17 +678,44 @@ def create_notion_page(structured: dict, transcription: str) -> str:
 # handlers
 # =====================================================================
 async def cmd_start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_allowed(update):
-        return await _reject(update)
+    await _register(update)
     await update.message.reply_text(
         "Привет! 👋\n\n"
-        "Пришли мне голосовое сообщение (надиктованное или пересланное из другого "
-        "чата — например, кусок подкаста), и я:\n"
-        "1. Расшифрую его через Whisper.\n"
-        "2. Спрошу, есть ли моменты, которые ты хочешь выделить.\n"
-        "3. Структурирую всё через Claude.\n"
-        "4. Сохраню карточку в твою базу Notion.\n\n"
-        "Языки: русский, українська."
+        "Я делаю структурированные конспекты.\n\n"
+        "🗣 <b>Голосовое</b> (надиктованное или пересланное — например, кусок "
+        "подкаста): расшифрую, потом структурирую.\n\n"
+        "📝 <b>Текст</b> (своя заметка, пересланный пост, выдержка из статьи): "
+        "структурирую, сделаю выжимку.\n\n"
+        "Дополнительно можешь указать моменты, которые хочешь выделить для заметки.\n\n"
+        "Языки: українська, русский.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_limits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Показывает пользователю остаток недельной квоты."""
+    user = await _register(update)
+
+    if _is_admin(update):
+        await update.message.reply_text("⭐ У тебя админский доступ — без лимитов.")
+        return
+    if user["status"] == "unlimited":
+        await update.message.reply_text("⭐ У тебя безлимитный доступ.")
+        return
+    if user["status"] == "blocked":
+        await update.message.reply_text("⛔ Доступ к боту ограничен.")
+        return
+
+    usage = await asyncio.to_thread(db.weekly_usage, user["user_id"])
+    await update.message.reply_text(
+        "📊 <b>Осталось на неделю</b>\n\n"
+        f"{_esc(_fmt_left(usage))}\n\n"
+        f"<i>Лимит: {FREE_LIMITS['voice_count']} голосовых "
+        f"({FREE_LIMITS['voice_seconds']//60} мин) и "
+        f"{FREE_LIMITS['text_count']} текстов "
+        f"({FREE_LIMITS['text_chars']} симв.) за 7 дней.\n"
+        "Окно скользящее — квота восстанавливается постепенно.</i>",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -565,12 +728,37 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Точка входа: пришло голосовое или аудио. Скачиваем и спрашиваем язык."""
-    if not _is_allowed(update):
-        await _reject(update)
+    """
+    Точка входа: голосовое/аудио.
+    Скачиваем → узнаём длительность → проверяем лимиты → спрашиваем язык.
+    Длительность проверяем ДО транскрипции, чтобы не тратить деньги впустую.
+    """
+    msg = update.message
+    is_admin = _is_admin(update)
+
+    # Быстрая длительность из метаданных Telegram (без скачивания)
+    tg_duration = 0
+    if msg.voice:
+        tg_duration = msg.voice.duration or 0
+    elif msg.audio:
+        tg_duration = msg.audio.duration or 0
+    elif msg.video_note:
+        tg_duration = msg.video_note.duration or 0
+
+    # Потолок на одно голосовое для обычных пользователей
+    if not is_admin and tg_duration > FREE_MAX_VOICE_SECONDS:
+        await msg.reply_text(
+            f"⛔ Слишком длинное аудио: {tg_duration/60:.1f} мин.\n"
+            f"Максимум за раз — {FREE_MAX_VOICE_SECONDS/60:.0f} мин."
+        )
         return ConversationHandler.END
 
-    msg = update.message
+    # Проверка лимитов (регистрирует пользователя в БД)
+    ok, is_admin, reason = await _gate(update, "voice", tg_duration)
+    if not ok:
+        await msg.reply_text(reason)
+        return ConversationHandler.END
+
     status = await msg.reply_text("🎧 Скачиваю аудио…")
 
     # Выбираем источник (voice — обычное «кружочек», audio — файл/пересланное)
@@ -588,12 +776,28 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         return ConversationHandler.END
 
     voice_path = TMP_DIR / f"{msg.chat_id}_{msg.message_id}{ext}"
-    await tg_file.download_to_drive(str(voice_path))
+    try:
+        await tg_file.download_to_drive(str(voice_path))
+    except Exception as e:  # noqa: BLE001
+        log.exception("Download failed")
+        await status.edit_text(
+            "❌ Не смог скачать файл. Telegram отдаёт боту файлы до 20 МБ — "
+            "возможно, аудио слишком большое."
+        )
+        return ConversationHandler.END
 
-    # Запоминаем путь и координаты статус-сообщения
-    context.user_data["voice_path"] = str(voice_path)
-    context.user_data["status_chat_id"] = status.chat_id
-    context.user_data["status_msg_id"] = status.message_id
+    user = update.effective_user
+    db_user = await asyncio.to_thread(db.get_user, user.id)
+
+    context.user_data.update({
+        "voice_path": str(voice_path),
+        "status_chat_id": status.chat_id,
+        "status_msg_id": status.message_id,
+        "is_admin": is_admin,
+        "user_id": user.id,
+        "unlimited": bool(db_user and db_user["status"] == "unlimited"),
+        "charge": tg_duration,   # спишем секунды после успешной обработки
+    })
 
     # Если язык задан в конфиге — не спрашиваем, сразу транскрибируем
     if DEFAULT_LANG in ("ru", "uk", "auto"):
@@ -604,8 +808,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     keyboard = InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru"),
                 InlineKeyboardButton("🇺🇦 Українська", callback_data="lang_uk"),
+                InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru"),
             ],
             [InlineKeyboardButton("🤖 Определить автоматически", callback_data="lang_auto")],
             [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
@@ -613,8 +817,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     )
     await status.edit_text(
         "🎧 Аудио получено. На каком языке говорят?\n"
-        "<i>(подсказка языка сильно повышает точность и убирает "
-        "случайный перевод на английский)</i>",
+        "<i>(подсказка языка повышает точность расшифровки)</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
@@ -650,7 +853,12 @@ async def _run_transcription(context: ContextTypes.DEFAULT_TYPE, status_msg,
         transcription = await transcribe(voice_path, status_msg, language)
     except Exception as e:  # noqa: BLE001
         log.exception("Whisper failed")
-        await status_msg.edit_text(f"❌ Ошибка транскрипции: {e}")
+        if context.user_data.get("is_admin"):
+            await status_msg.edit_text(f"❌ Ошибка транскрипции: {e}")
+        else:
+            await status_msg.edit_text(
+                "❌ Не получилось расшифровать аудио. Попробуй ещё раз."
+            )
         _cleanup_voice(context)
         context.user_data.clear()
         return ConversationHandler.END
@@ -663,12 +871,10 @@ async def _run_transcription(context: ContextTypes.DEFAULT_TYPE, status_msg,
         return ConversationHandler.END
 
     context.user_data["transcription"] = transcription
+    context.user_data["source"] = "voice"
 
-    preview = transcription if len(transcription) <= 900 else transcription[:900] + "…"
-    total_chars = len(transcription)
-    length_note = ""
-    if total_chars > 900:
-        length_note = f"\n<i>(показан фрагмент; всего {total_chars} символов, ~{total_chars // 5} слов)</i>\n"
+    is_admin = context.user_data.get("is_admin", False)
+
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✍️ Добавить акценты", callback_data="add_highlights")],
@@ -676,9 +882,27 @@ async def _run_transcription(context: ContextTypes.DEFAULT_TYPE, status_msg,
             [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
         ]
     )
+
+    if is_admin:
+        # Админу показываем транскрипцию
+        preview = transcription if len(transcription) <= 900 else transcription[:900] + "…"
+        total_chars = len(transcription)
+        length_note = ""
+        if total_chars > 900:
+            length_note = (
+                f"\n<i>(показан фрагмент; всего {total_chars} символов, "
+                f"~{total_chars // 5} слов)</i>\n"
+            )
+        body = (
+            f"✅ <b>Транскрипция готова</b>\n\n"
+            f"<i>{_esc(preview)}</i>\n{length_note}\n"
+        )
+    else:
+        # Обычным — без транскрипции
+        body = "✅ <b>Расшифровал.</b>\n\n"
+
     await status_msg.edit_text(
-        f"✅ <b>Транскрипция готова</b>\n\n<i>{preview}</i>\n{length_note}\n"
-        "Есть моменты, которые хочешь выделить в конспекте?",
+        body + "Есть моменты, которые хочешь выделить в конспекте?",
         parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
@@ -690,6 +914,77 @@ def _cleanup_voice(context: ContextTypes.DEFAULT_TYPE) -> None:
     p = context.user_data.get("voice_path")
     if p:
         Path(p).unlink(missing_ok=True)
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """
+    Точка входа: пришёл обычный текст (своя заметка, пересланный пост, статья).
+    Пропускаем Whisper и выбор языка — сразу спрашиваем про акценты.
+    """
+    text = (update.message.text or "").strip()
+    is_admin = _is_admin(update)
+
+    if len(text) < MIN_TEXT_LENGTH:
+        await update.message.reply_text(
+            f"🤔 Слишком короткий текст для конспекта "
+            f"(нужно хотя бы {MIN_TEXT_LENGTH} символов).\n"
+            "Пришли голосовое или текст подлиннее."
+        )
+        return ConversationHandler.END
+
+    # Потолок на одно сообщение для обычных пользователей
+    if not is_admin and len(text) > FREE_MAX_TEXT_LENGTH:
+        await update.message.reply_text(
+            f"⛔ Слишком длинный текст: {len(text)} символов.\n"
+            f"Максимум за раз — {FREE_MAX_TEXT_LENGTH}."
+        )
+        return ConversationHandler.END
+
+    # Проверка лимитов (регистрирует пользователя в БД)
+    ok, is_admin, reason = await _gate(update, "text", len(text))
+    if not ok:
+        await update.message.reply_text(reason)
+        return ConversationHandler.END
+
+    user = update.effective_user
+    db_user = await asyncio.to_thread(db.get_user, user.id)
+
+    context.user_data.update({
+        "transcription": text,
+        "source": "text",
+        "is_admin": is_admin,
+        "user_id": user.id,
+        "unlimited": bool(db_user and db_user["status"] == "unlimited"),
+        "charge": len(text),   # спишем символы после успешной обработки
+    })
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✍️ Добавить акценты", callback_data="add_highlights")],
+            [InlineKeyboardButton("⚡ Обработать как есть", callback_data="process_now")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        ]
+    )
+
+    if is_admin:
+        preview = text if len(text) <= 900 else text[:900] + "…"
+        length_note = ""
+        if len(text) > 900:
+            length_note = (
+                f"\n<i>(показан фрагмент; всего {len(text)} символов)</i>\n"
+            )
+        body = f"📝 <b>Текст получен</b>\n\n<i>{_esc(preview)}</i>\n{length_note}\n"
+    else:
+        body = f"📝 <b>Текст получен</b> ({len(text)} символов)\n\n"
+
+    status = await update.message.reply_text(
+        body + "Есть моменты, которые хочешь выделить в конспекте?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+    context.user_data["status_chat_id"] = status.chat_id
+    context.user_data["status_msg_id"] = status.message_id
+    return WAITING_FOR_HIGHLIGHTS
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -722,10 +1017,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def handle_highlights_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Пользователь прислал текст с акцентами — обрабатываем."""
-    if not _is_allowed(update):
-        return ConversationHandler.END
-
-    highlights = (update.message.text or "").strip()
+    highlights = (update.message.text or "").strip()[:1000]
     status = await update.message.reply_text("🧠 Учёл акценты, структурирую и сохраняю в Notion…")
     await _finalize(
         context,
@@ -738,9 +1030,18 @@ async def handle_highlights_text(update: Update, context: ContextTypes.DEFAULT_T
 
 async def _finalize(context: ContextTypes.DEFAULT_TYPE, *, highlights: str | None,
                     chat_id: int, edit_message_id: int) -> None:
-    """Общий финал: Claude → Notion → отчёт пользователю."""
+    """
+    Общий финал: Claude → (Notion для админа | только чат для обычных) → отчёт.
+    Здесь же списывается квота обычного пользователя.
+    """
     bot = context.bot
-    transcription = context.user_data.get("transcription", "")
+    source_text = context.user_data.get("transcription", "")
+    source = context.user_data.get("source", "voice")   # "voice" | "text"
+    is_admin = context.user_data.get("is_admin", False)
+    user_id = context.user_data.get("user_id")
+    # Сколько списать: секунды для голосового, символы для текста
+    charge = context.user_data.get("charge", 0)
+    unlimited = context.user_data.get("unlimited", False)
 
     async def _edit(text: str, **kw) -> None:
         try:
@@ -753,21 +1054,56 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, *, highlights: str | Non
         except Exception:  # noqa: BLE001
             await bot.send_message(chat_id=chat_id, text=text, **kw)
 
-    if not transcription:
-        await _edit("❌ Потерял транскрипцию. Пришли голосовое заново.")
+    if not source_text:
+        await _edit("❌ Потерял исходный текст. Пришли голосовое или текст заново.")
         context.user_data.clear()
         return
 
     try:
-        structured = await analyze_with_claude(transcription, highlights)
+        structured = await analyze_with_claude(
+            source_text, highlights, source, concise=not is_admin
+        )
     except Exception as e:  # noqa: BLE001
         log.exception("Claude/OpenRouter failed")
-        await _edit(f"❌ Ошибка анализа (OpenRouter/Claude): {e}")
+        await _edit(f"❌ Ошибка анализа: {e}" if is_admin
+                    else "❌ Не получилось обработать. Попробуй ещё раз чуть позже.")
         context.user_data.clear()
         return
 
+    # ---------- обычный пользователь: выжимка только в чат, без Notion ----------
+    if not is_admin:
+        # списываем квоту (безлимитным — не списываем)
+        if user_id and not unlimited:
+            await asyncio.to_thread(db.add_usage, user_id, source, charge)
+
+        summary = structured["summary"]
+        if len(summary) > FREE_SUMMARY_CHARS:
+            summary = summary[:FREE_SUMMARY_CHARS].rsplit("\n", 1)[0] + "…"
+
+        text = (
+            f"✅ <b>{_esc(structured['title'])}</b>\n"
+            f"🏷 {_esc(structured['tag'])}\n\n"
+            f"{_esc(summary)}"
+        )
+
+        # Хвост с остатком лимита
+        if user_id and not unlimited:
+            usage = await asyncio.to_thread(db.weekly_usage, user_id)
+            text += f"\n\n<i>Осталось на неделю:\n{_esc(_fmt_left(usage))}</i>"
+
+        # Страховка: TG режет на 4096
+        if len(text) > 4000:
+            text = text[:4000] + "…"
+
+        await _edit(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        context.user_data.clear()
+        return
+
+    # ---------- админ: полный конспект + Notion ----------
     try:
-        page_url = await asyncio.to_thread(create_notion_page, structured, transcription)
+        page_url = await asyncio.to_thread(
+            create_notion_page, structured, source_text, source
+        )
     except Exception as e:  # noqa: BLE001
         log.exception("Notion failed")
         await _edit(
@@ -783,9 +1119,9 @@ async def _finalize(context: ContextTypes.DEFAULT_TYPE, *, highlights: str | Non
 
     await _edit(
         f"✅ <b>Готово!</b>\n\n"
-        f"<b>{structured['title']}</b>\n"
-        f"🏷 <code>{structured['tag']}</code>\n\n"
-        f"{summary_preview}\n\n"
+        f"<b>{_esc(structured['title'])}</b>\n"
+        f"🏷 <code>{_esc(structured['tag'])}</code>\n\n"
+        f"{_esc(summary_preview)}\n\n"
         f"🔗 <a href=\"{page_url}\">Открыть в Notion</a>",
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
@@ -804,7 +1140,14 @@ def main() -> None:
             MessageHandler(
                 filters.VOICE | filters.AUDIO | filters.VIDEO_NOTE,
                 handle_voice,
-            )
+            ),
+            # Текст как второй вход: своя заметка, пересланный пост, статья.
+            # Срабатывает только вне диалога — внутри WAITING_FOR_HIGHLIGHTS
+            # текст перехватывается как «акценты».
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                handle_text,
+            ),
         ],
         states={
             CHOOSING_LANGUAGE: [
@@ -820,12 +1163,23 @@ def main() -> None:
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("limits", cmd_limits))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+
+    # ВАЖНО: админка регистрируется ДО основного диалога.
+    # Иначе ввод админа (поиск пользователя) уйдёт в конспект как текст.
+    app.add_handler(admin.build_admin_handler(ADMIN_IDS, FREE_LIMITS))
     app.add_handler(conv)
 
-    log.info("Bot started (chat=%s, stt=%s)", OPENROUTER_MODEL, WHISPER_MODEL)
+    log.info(
+        "Bot started (chat=%s, stt=%s, admins=%s)",
+        OPENROUTER_MODEL, WHISPER_MODEL, sorted(ADMIN_IDS) or "нет!",
+    )
+    if not ADMIN_IDS:
+        log.warning("ADMIN_IDS пуст — админ-панель недоступна, Notion не работает ни для кого!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
+    db.init_db()
     main()

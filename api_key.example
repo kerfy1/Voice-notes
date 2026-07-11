@@ -1,60 +1,58 @@
-# --- Telegram ---
-# Получить у @BotFather → /newbot
+# ============ ОБЯЗАТЕЛЬНЫЕ ============
+
+# --- Telegram --- (@BotFather → /newbot)
 TELEGRAM_BOT_TOKEN=
 
-# --- OpenRouter (Whisper + Claude, один аккаунт на всё) ---
-# https://openrouter.ai/keys
+# --- OpenRouter (Whisper + Claude) --- https://openrouter.ai/keys
 OPENROUTER_API_KEY=
 
-# Модель для структурирования (Claude по умолчанию).
-# Каталог моделей: https://openrouter.ai/models
-OPENROUTER_MODEL=anthropic/claude-sonnet-4.5
+# --- Админы ---
+# ID через запятую. Полный доступ: Notion, без лимитов, админ-панель (/admin).
+# Свой ID узнать у @userinfobot. БЕЗ ЭТОГО НЕ БУДЕТ РАБОТАТЬ NOTION.
+ADMIN_IDS=
 
-# Модель для транскрипции.
-# openai/whisper-1 — та же модель, что у OpenAI напрямую (качество не пострадает).
-# Альтернативы (дешевле/быстрее, но чуть иное качество):
-#   openai/whisper-large-v3        — свежее поколение, дешевле
-#   openai/whisper-large-v3-turbo  — самый быстрый, real-time × 200+
-#   openai/gpt-4o-mini-transcribe  — токен-биллинг, для больших объёмов
-WHISPER_MODEL=openai/whisper-large-v3
-
-# Язык транскрипции.
-# Пусто → бот КАЖДЫЙ раз спрашивает язык кнопками (🇷🇺/🇺🇦/авто) — удобно при миксе.
-# Можно зафиксировать, чтобы не спрашивал: ru | uk | auto
-#   ru   — всегда русский
-#   uk   — всегда украинский
-#   auto — всегда автоопределение (риск путаницы ru↔be и перевода на англ.)
-DEFAULT_LANG=
-
-# --- Обработка длинных аудио (30+ минут, подкасты) ---
-# Длительность одного чанка при нарезке (сек). 300 = 5 мин.
-# whisper-1 обрабатывает ~5× realtime, а у OpenRouter таймаут ~60 сек на запрос,
-# так что 5 мин — безопасный размер. Для whisper-large-v3-turbo можно поднять.
-CHUNK_SECONDS=300
-# Если аудио короче этого — не режем, гоним одним куском (сек).
-NO_SPLIT_UNDER=420
-# Предохранитель от случайно пересланного 8-часового аудиокурса (сек).
-MAX_AUDIO_SECONDS=7200
-
-# Пути к бинарникам ffmpeg — если они не в PATH, укажи полные:
-# FFMPEG_BIN=/usr/local/bin/ffmpeg
-# FFPROBE_BIN=/usr/local/bin/ffprobe
-
-# --- Notion ---
-# 1. Создать интеграцию: https://www.notion.so/my-integrations
-# 2. Скопировать Internal Integration Secret сюда
+# ============ NOTION (только для админов) ============
+# Если не заполнить — бот работает, но карточки в Notion не создаются.
 NOTION_TOKEN=
-# ID базы (32 символа из URL: notion.so/<workspace>/<DATABASE_ID>?v=...)
 NOTION_DATABASE_ID=
 
-# --- Notion property names (опционально) ---
-# Имена колонок в твоей базе. По умолчанию — как у тебя на скриншоте (укр.).
-# Если переименуешь колонки в Notion — поменяй здесь.
-NOTION_PROP_TITLE=Название заметки
-NOTION_PROP_ESSENCE=Содержание
+# Имена колонок в базе Notion
+NOTION_PROP_TITLE=Назва ідеї
+NOTION_PROP_ESSENCE=Суть
 NOTION_PROP_DATE=Дата
 NOTION_PROP_TAG=Тег
 
-# --- Access control (опционально) ---
-# ID через запятую. Если пусто — бот отвечает всем. Свой ID: @userinfobot
-ALLOWED_USER_IDS=
+# ============ ЛИМИТЫ обычных пользователей ============
+# Скользящее окно 7 дней. Срабатывает то, что кончится раньше: штуки ИЛИ объём.
+FREE_VOICE_COUNT=5
+FREE_VOICE_MINUTES=31
+FREE_TEXT_COUNT=5
+FREE_TEXT_CHARS=25000
+
+# Потолок на ОДНО сообщение
+FREE_MAX_TEXT_LENGTH=5000
+FREE_MAX_VOICE_MINUTES=15
+
+# Длина выжимки для обычных пользователей (влезает в одно сообщение TG)
+FREE_SUMMARY_CHARS=1200
+
+# ============ МОДЕЛИ ============
+OPENROUTER_MODEL=anthropic/claude-sonnet-4.5
+WHISPER_MODEL=openai/whisper-1
+MAX_OUTPUT_TOKENS=4000
+
+# ============ ПРОЧЕЕ ============
+# Язык: пусто → спрашивать кнопками. Или зафиксировать: ru | uk | auto
+DEFAULT_LANG=
+
+# Минимальная длина текста для конспекта
+MIN_TEXT_LENGTH=100
+
+# Нарезка длинных аудио
+CHUNK_SECONDS=300
+NO_SPLIT_UNDER=420
+MAX_AUDIO_SECONDS=7200
+
+# Пути к ffmpeg, если не в PATH
+# FFMPEG_BIN=/usr/bin/ffmpeg
+# FFPROBE_BIN=/usr/bin/ffprobe
